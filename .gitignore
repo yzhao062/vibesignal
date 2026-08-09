@@ -16,3 +16,8 @@ agents/
 
 # IDE
 .idea/
+
+# Drop box for files handed to agents; keep the folder and its README
+# (must be todo/*, not todo/ -- git cannot re-include a file under an excluded directory)
+todo/*
+!todo/README.md
