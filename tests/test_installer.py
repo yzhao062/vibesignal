@@ -9,6 +9,8 @@ tools; those are exercised manually via the CLI rather than in unit tests.
 """
 
 import json
+import shlex
+import sys
 
 import pytest
 
@@ -206,6 +208,112 @@ def test_windows_shortcut_ps1_escapes_single_quote_in_path():
     assert "'C:\\o''brien\\pythonw.exe'" in ps1
 
 
+def test_windows_shortcut_ps1_stages_on_ascii_path_then_moves():
+    # WScript.Shell.Save() converts its destination through the ANSI codepage,
+    # so it must never be pointed straight at the final folder: a localized or
+    # OneDrive-redirected Desktop is not ANSI-encodable and the save throws.
+    ps1 = installer._windows_shortcut_ps1(
+        "Desktop", r"C:\Py\pythonw.exe", "-m vibesignal widget", r"C:\Users\jane"
+    )
+    assert "$s = $sh.CreateShortcut($stage)" in ps1
+    assert "$sh.CreateShortcut($lnk)" not in ps1
+    assert "Move-Item -LiteralPath $stage -Destination $lnk -Force" in ps1
+    # The staging directory itself must be ANSI-encodable, which $env:TEMP is
+    # not when the account name is non-ASCII; 8.3 short names always are.
+    assert "ShortPath" in ps1
+    # The resolved path travels back as UTF-8, matching _run_powershell.
+    assert "[Console]::OutputEncoding = [Text.Encoding]::UTF8" in ps1
+
+
+def test_windows_shortcut_ps1_cleans_up_stage_on_failure():
+    ps1 = installer._windows_shortcut_ps1(
+        "Startup", r"C:\Py\pythonw.exe", "-m vibesignal widget", r"C:\Users\jane"
+    )
+    assert "} finally {" in ps1
+    assert "Remove-Item -LiteralPath $stage" in ps1
+    # Creation and Save() must sit inside the cleanup boundary: a Save() that
+    # fails after partially writing the stage would otherwise leak the file.
+    assert ps1.index("try {") < ps1.index("$sh.CreateShortcut($stage)")
+    assert ps1.index("$s.Save()") < ps1.index("} finally {")
+
+
+def test_windows_shortcut_ps1_refuses_non_ascii_staging_path():
+    # The 8.3 fallback is not guaranteed: Microsoft documents that a short name
+    # may not exist and that the API can succeed by returning the long path
+    # unchanged. Silently continuing would hand WScript.Shell exactly the path
+    # this function exists to avoid, so the result is re-checked and the script
+    # fails with an actionable message instead.
+    ps1 = installer._windows_shortcut_ps1(
+        "Desktop", r"C:\Py\pythonw.exe", "-m vibesignal widget", r"C:\Users\jane"
+    )
+    # Two guards: one after the catch, one on the resolved value.
+    assert ps1.count("$stageDir -match '[^\\x00-\\x7F]'") == 2
+    assert "could not find an ASCII staging path" in ps1
+    # The ShortPath catch must report, not swallow. Exactly one silent catch
+    # remains, the deliberate no-op on the OutputEncoding line.
+    assert ps1.count("} catch { }") == 1
+    assert "OutputEncoding = [Text.Encoding]::UTF8 } catch { }" in ps1
+    assert "could not resolve an ASCII staging path" in ps1
+
+
+def test_run_powershell_reports_stderr_on_failure(monkeypatch):
+    # A bare CalledProcessError names only the temp script, which tells the
+    # user nothing about what failed.
+    class _Result:
+        returncode = 1
+        stdout = ""
+        stderr = 'Unable to save shortcut "C:\\Users\\me\\OneDrive\\??\\x.lnk".'
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *a, **k: _Result())
+    with pytest.raises(RuntimeError) as exc:
+        installer._run_powershell("Write-Output 'x'")
+    assert "exit 1" in str(exc.value)
+    assert "Unable to save shortcut" in str(exc.value)
+
+
+def test_run_powershell_returns_trimmed_stdout(monkeypatch):
+    class _Result:
+        returncode = 0
+        stdout = "  C:\\Users\\jane\\Desktop\\VibeSignal.lnk  \n"
+        stderr = ""
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *a, **k: _Result())
+    assert (
+        installer._run_powershell("Write-Output 'x'")
+        == r"C:\Users\jane\Desktop\VibeSignal.lnk"
+    )
+
+
+@pytest.mark.skipif("sys.platform != 'win32'", reason="exercises real PowerShell")
+def test_windows_shortcut_write_survives_non_ascii_destination(tmp_path):
+    # End-to-end regression guard: write a real .lnk into a directory whose
+    # name is not ANSI-encodable. Before staging was introduced this raised
+    # FileNotFoundException with the name mangled to "?".
+    dest = tmp_path / "桌面"
+    dest.mkdir()
+    script = _ps1_for_dir(dest, r"C:\Windows\System32\notepad.exe", "", str(tmp_path))
+    out = installer._run_powershell(script)
+    assert out == str(dest / "VibeSignal.lnk")
+    assert (dest / "VibeSignal.lnk").is_file()
+
+
+def _ps1_for_dir(directory, target, arguments, workdir):
+    """The real shortcut script with a literal directory in place of a known folder.
+
+    The marker is asserted before substitution on purpose. An unchecked replace
+    turns into a silent no-op the moment production reformats that line, and the
+    test would then run the real Desktop branch and overwrite a developer's
+    actual VibeSignal.lnk before failing on its output assertion.
+    """
+    real = installer._windows_shortcut_ps1("Desktop", target, arguments, workdir)
+    marker = "$dir = [Environment]::GetFolderPath('Desktop')"
+    assert real.count(marker) == 1, (
+        "shortcut script no longer contains exactly one Desktop folder lookup; "
+        "update _ps1_for_dir rather than letting it silently target the real Desktop"
+    )
+    return real.replace(marker, f"$dir = {installer._ps_squote(str(directory))}", 1)
+
+
 def test_windows_remove_ps1_targets_named_shortcut():
     ps1 = installer._windows_remove_ps1("Programs")
     assert "GetFolderPath('Programs')" in ps1
@@ -336,11 +444,139 @@ def test_agent_hooks_spec_codex_tag():
     assert all("--agent codex" in c for c in _all_commands(spec))
 
 
-def test_hook_command_quotes_spaces():
+def test_hook_command_quotes_spaces(monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
     cmd = installer._hook_command(
         ["/Users/jane doe/vibesignal"], ["event", "--state", "working"])
     assert "'/Users/jane doe/vibesignal'" in cmd
     assert cmd.endswith("event --state working")
+
+
+def test_hook_command_codex_on_windows_uses_cmd_quoting(monkeypatch):
+    # Codex runs hook commands through cmd.exe, where a single quote is an
+    # ordinary character. A shlex-quoted Windows path therefore reaches cmd
+    # verbatim and the hook dies with "The filename, directory name, or volume
+    # label syntax is incorrect." -> exit 1.
+    monkeypatch.setattr("sys.platform", "win32")
+    cmd = installer._hook_command(
+        [r"C:\Users\jane\envs\py312\python.exe", "-m", "vibesignal"],
+        ["event", "--agent", "codex", "--state", "working", "--quiet"],
+        "codex",
+    )
+    assert r'"C:\Users\jane\envs\py312\python.exe"' in cmd
+    assert "'" not in cmd
+
+
+def test_hook_command_claude_on_windows_stays_posix(monkeypatch):
+    # Claude Code runs hooks through a POSIX shell, so POSIX quoting is the
+    # correct grammar there. Sharing cmd's format would break a $ component.
+    monkeypatch.setattr("sys.platform", "win32")
+    cmd = installer._hook_command(
+        [r"C:\Users\jane\python.exe"], ["event"], "claude")
+    assert cmd.startswith("'")
+
+
+def test_cmd_quote_leaves_plain_flag_bare():
+    assert installer._cmd_quote("--quiet") == "--quiet"
+    assert installer._cmd_quote("event") == "event"
+
+
+def test_cmd_quote_quotes_backslash_for_the_stored_round_trip():
+    # cmd itself would accept the bare path. The quoting is for the way back:
+    # the stored command is re-parsed with POSIX shlex.split by
+    # _hook_is_vibesignal, which would consume the separators.
+    assert installer._cmd_quote(r"C:\dir\python.exe") == r'"C:\dir\python.exe"'
+    assert shlex.split(installer._cmd_quote(r"C:\dir\python.exe")) == [
+        r"C:\dir\python.exe"]
+
+
+def test_cmd_quote_rejects_embedded_quote():
+    # The CRT layer can be escaped, but cmd does not treat the preceding
+    # backslash as an escape, so a later metacharacter escapes the quoted
+    # region. Reject rather than claim support that does not hold.
+    with pytest.raises(ValueError, match="break out of the quoted region"):
+        installer._cmd_quote('a"b&c')
+
+
+def test_cmd_quote_doubles_trailing_backslash_when_quoting():
+    # Once quotes are required, the CRT reads \" as an escaped quote, so a path
+    # ending in a separator would otherwise swallow its own closing quote.
+    assert installer._cmd_quote("C:\\my dir\\") == '"C:\\my dir\\\\"'
+
+
+def test_cmd_quote_quotes_empty_and_metacharacters():
+    assert installer._cmd_quote("") == '""'
+    assert installer._cmd_quote("a&b") == '"a&b"'
+
+
+@pytest.mark.skipif("sys.platform != 'win32'", reason="Windows command persistence")
+def test_codex_console_script_hooks_remain_idempotent_and_removable():
+    """The stored Codex command must still be recognizable as ours.
+
+    vibesignal_args() prefers the direct console-script form, so the pinned
+    token is normally a bare `...\\Scripts\\vibesignal.exe`. If the stored
+    command does not survive the POSIX shlex round trip in _hook_is_vibesignal,
+    a reinstall silently duplicates every handler and uninstall cannot find any
+    of them. Asserting the quote character alone does not catch that; this
+    drives the real install/reinstall/remove lifecycle.
+    """
+    spec = installer.agent_hooks_spec([r"C:\env\Scripts\vibesignal.exe"], "codex")
+    handler = spec["UserPromptSubmit"][0]["hooks"][0]
+    assert installer._hook_is_vibesignal(handler)
+
+    settings: dict = {}
+    installer._merge_hooks(settings, spec)
+    installer._merge_hooks(settings, spec)
+    assert len(settings["hooks"]["UserPromptSubmit"]) == 1  # idempotent
+    assert installer._strip_hooks(settings) is True          # removable
+    assert "hooks" not in settings
+
+
+def test_cmd_quote_rejects_percent():
+    # cmd expands %NAME% even inside double quotes and %% works only in a batch
+    # file, so this cannot be represented and must not be emitted silently.
+    with pytest.raises(ValueError, match="percent"):
+        installer._cmd_quote(r"C:\foo\%PATH%\python.exe")
+
+
+@pytest.mark.skipif("sys.platform != 'win32'", reason="parses via real shells")
+@pytest.mark.parametrize("path", [
+    r"C:\Users\jane doe\envs\py312\python.exe",   # space
+    r"\\server\share\python.exe",                  # UNC
+    r"C:\foo\$bar\python.exe",                     # $ component
+    r"C:\foo\bar\\",                               # trailing backslash
+])
+def test_hook_command_round_trips_through_each_real_shell(monkeypatch, path):
+    """The generated string must survive the shell that will actually parse it.
+
+    Asserting which quote character was chosen proves nothing: the original bug
+    passed that kind of check while cmd still failed to launch. These run the
+    token through both real parsers -- cmd.exe plus the CRT argv rules for the
+    Codex path, and the POSIX shell for the Claude path -- and compare what the
+    program actually received against what was asked for.
+    """
+    import subprocess as sp
+    monkeypatch.setattr("sys.platform", "win32")
+    echo_argv = "import sys;sys.stdout.write(sys.argv[1])"
+
+    # Codex -> cmd.exe, then the CRT argv parser inside the launched program.
+    line = " ".join([
+        installer._cmd_quote(sys.executable),
+        "-c", installer._cmd_quote(echo_argv),
+        installer._cmd_quote(path),
+    ])
+    out = sp.run(line, shell=True, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == path
+
+    # Claude -> POSIX shell. Parsed with shlex rather than executed through Git
+    # Bash on purpose: MSYS rewrites Windows-looking arguments before the
+    # program sees them, so a UNC or trailing-separator path comes back altered
+    # and the test would be measuring the emulator's path translation instead of
+    # the quoting. shlex.split is the exact inverse of shlex.quote, so this
+    # checks the POSIX grammar itself.
+    posix_line = installer._hook_command([path], [], "claude")
+    assert shlex.split(posix_line) == [path]
 
 
 def test_merge_hooks_preserves_and_is_idempotent():

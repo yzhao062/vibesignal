@@ -245,7 +245,10 @@ def _macos_uninstall_autostart() -> bool:
 # Windows: .lnk shortcuts via the stock PowerShell WScript.Shell COM object.
 # The widget runs `pythonw -m vibesignal widget` so there is no console window.
 # [Environment]::GetFolderPath resolves Startup / Programs / Desktop correctly
-# even when the Desktop is redirected into OneDrive.
+# even when the Desktop is redirected into OneDrive. Resolving the folder is
+# not the whole story: the COM object cannot *save* into one whose name is not
+# ANSI-encodable, so shortcuts are staged on an ASCII path and moved into
+# place. See _windows_shortcut_ps1.
 # --------------------------------------------------------------------------- #
 
 def _windows_pythonw() -> str:
@@ -272,18 +275,67 @@ def _windows_shortcut_ps1(folder_id: str, target: str, arguments: str, workdir: 
 
     ``folder_id`` is a ``System.Environment.SpecialFolder`` name -- ``Startup``,
     ``Programs``, or ``Desktop``. The script prints the resolved .lnk path.
+
+    The shortcut is built at an ASCII staging path and then moved into place.
+    ``WScript.Shell``'s ``Save()`` converts its destination through the ANSI
+    codepage, so saving straight into a directory whose name is not encodable
+    there loses the characters and throws ``FileNotFoundException``:
+
+        Unable to save shortcut "C:\\Users\\me\\OneDrive\\??\\VibeSignal.lnk".
+
+    That covers any localized Desktop (``桌面``, ``デスクトップ``, ``Рабочий стол``)
+    and OneDrive-redirected profiles, which is the common case on non-English
+    Windows rather than an exotic one. ``Move-Item`` is plain .NET and handles
+    Unicode, so staging first and moving second is safe for every folder.
     """
     return (
         "$ErrorActionPreference = 'Stop'\n"
+        # Emit the resolved path as UTF-8 so a non-ASCII folder survives the
+        # trip back to Python, which decodes this stdout as UTF-8.
+        "try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }\n"
         f"$dir = [Environment]::GetFolderPath({_ps_squote(folder_id)})\n"
         f"$lnk = Join-Path $dir {_ps_squote(SHORTCUT_NAME)}\n"
-        "$sh = New-Object -ComObject WScript.Shell\n"
-        "$s = $sh.CreateShortcut($lnk)\n"
-        f"$s.TargetPath = {_ps_squote(target)}\n"
-        f"$s.Arguments = {_ps_squote(arguments)}\n"
-        f"$s.WorkingDirectory = {_ps_squote(workdir)}\n"
-        "$s.Description = 'VibeSignal status widget'\n"
-        "$s.Save()\n"
+        # The staging directory has to be ANSI-encodable for the same reason the
+        # destination cannot be. $env:TEMP sits under the user profile, so it is
+        # non-ASCII exactly when the account name is; fall back to its 8.3 short
+        # name when that happens. The fallback is not guaranteed: Microsoft
+        # documents that a short name may not exist (8.3 creation is disabled
+        # per-volume or system-wide) and that the API can succeed by returning
+        # the long path unchanged. Silently continuing there would hand
+        # WScript.Shell the very path this function exists to avoid, so the
+        # result is re-checked and a failure is reported instead of retried.
+        "$stageDir = $env:TEMP\n"
+        "if ($stageDir -match '[^\\x00-\\x7F]') {\n"
+        "  try {\n"
+        "    $stageDir = (New-Object -ComObject Scripting.FileSystemObject)"
+        ".GetFolder($stageDir).ShortPath\n"
+        "  } catch {\n"
+        "    throw \"VibeSignal could not resolve an ASCII staging path from "
+        "TEMP ($stageDir): $($_.Exception.Message)\"\n"
+        "  }\n"
+        "}\n"
+        "if ($stageDir -match '[^\\x00-\\x7F]') {\n"
+        "  throw 'VibeSignal could not find an ASCII staging path; set TEMP to "
+        "an ASCII-writable directory and retry.'\n"
+        "}\n"
+        "$stage = Join-Path $stageDir "
+        "('VibeSignal.' + [guid]::NewGuid().ToString('N') + '.lnk')\n"
+        # Creation and Save() belong inside the cleanup boundary: a Save() that
+        # fails after partially writing the stage would otherwise leak the file.
+        "try {\n"
+        "  $sh = New-Object -ComObject WScript.Shell\n"
+        "  $s = $sh.CreateShortcut($stage)\n"
+        f"  $s.TargetPath = {_ps_squote(target)}\n"
+        f"  $s.Arguments = {_ps_squote(arguments)}\n"
+        f"  $s.WorkingDirectory = {_ps_squote(workdir)}\n"
+        "  $s.Description = 'VibeSignal status widget'\n"
+        "  $s.Save()\n"
+        "  New-Item -ItemType Directory -Force -Path $dir | Out-Null\n"
+        "  Move-Item -LiteralPath $stage -Destination $lnk -Force\n"
+        "} finally {\n"
+        "  if (Test-Path -LiteralPath $stage) { "
+        "Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue }\n"
+        "}\n"
         "Write-Output $lnk\n"
     )
 
@@ -303,19 +355,38 @@ def _windows_remove_ps1(folder_id: str) -> str:
 
 
 def _run_powershell(script: str) -> str:
-    """Run a PowerShell script from a temp file; return its trimmed stdout."""
+    """Run a PowerShell script from a temp file; return its trimmed stdout.
+
+    Written with a UTF-8 BOM on purpose: Windows PowerShell 5.1 decodes a
+    ``-File`` script that has no BOM using the ANSI codepage, which corrupts any
+    non-ASCII path embedded in the script (a profile under a non-ASCII account
+    name). Stdout is decoded as UTF-8 to match the console encoding the script
+    sets for itself.
+
+    A non-zero exit raises with the child's stderr attached. The bare
+    ``CalledProcessError`` this used to raise printed only the temp-file path,
+    which said nothing about what actually went wrong.
+    """
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+        mode="w", suffix=".ps1", delete=False, encoding="utf-8-sig"
     ) as fh:
         fh.write(script)
         path = fh.name
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"PowerShell helper failed (exit {result.returncode}): "
+                f"{detail or 'no output'}"
+            )
         return result.stdout.strip()
     finally:
         Path(path).unlink(missing_ok=True)
@@ -438,13 +509,85 @@ def _agent_settings_path(agent: str) -> Path:
     )
 
 
-def _hook_command(args: list[str], tail: list[str]) -> str:
+def _cmd_quote(token: str) -> str:
+    """Quote one token for a ``cmd.exe`` command line.
+
+    A bare token is left alone only when it carries nothing that either the
+    shell or a later reader could misinterpret. Quotes are added for
+    whitespace, for cmd's own metacharacters (``&``, ``|``, ``<``, ``>``,
+    ``^``, parentheses), for the empty string, and -- importantly -- for a
+    backslash.
+
+    The backslash rule is not about cmd, which treats a backslash as an
+    ordinary character. It is about the round trip: this string is stored in
+    the agent's settings file and later re-parsed by ``_hook_is_vibesignal``
+    with POSIX ``shlex.split`` to decide whether a handler is ours. Outside
+    quotes ``shlex`` consumes each backslash as an escape, so a bare
+    ``C:\\env\\Scripts\\vibesignal.exe`` comes back as
+    ``C:envScriptsvibesignal.exe``, the handler stops being recognized, and
+    reinstall duplicates it while uninstall cannot find it. Quoting keeps the
+    separators intact on the way back.
+
+    Any run of backslashes immediately before the closing quote is doubled per
+    the CRT argument rules, so a path ending in a separator does not swallow
+    the quote that terminates it.
+
+    Two characters are rejected rather than encoded, because neither can be
+    represented faithfully and a silently mangled hook is worse than a loud
+    install failure:
+
+    * ``%`` -- cmd expands ``%NAME%`` even inside double quotes, and the ``%%``
+      escape works only inside a batch file.
+    * ``"`` -- the CRT layer can be escaped correctly, but cmd does not treat
+      the preceding backslash as an escape, so a later metacharacter can break
+      out of the quoted region (``a"b&c`` launches ``c"`` as a second command).
+
+    Neither can occur in a Windows filesystem path, and the fixed hook tail
+    contains neither, so this rejects only inputs the installer cannot produce.
+    """
+    for bad, why in (
+        ("%", "cmd expands a percent sign as an environment variable even "
+              "inside quotes, and offers no escape for it on a command line"),
+        ('"', "cmd does not treat the preceding backslash as an escape, so a "
+              "later metacharacter can break out of the quoted region"),
+    ):
+        if bad in token:
+            raise ValueError(
+                f"cannot place {token!r} in a cmd.exe hook command: {why}"
+            )
+    if token and not any(c in token for c in " \t\\&|<>^()"):
+        return token
+    trailing = len(token) - len(token.rstrip("\\"))
+    return '"' + token + "\\" * trailing + '"'
+
+
+def _hook_command(args: list[str], tail: list[str], agent: str = "claude") -> str:
     """Join the pinned argv with a hook tail into one shell command string.
 
-    Each token is shlex-quoted so a vibesignal path with a space survives the
+    Each token is quoted so a vibesignal path with a space survives the
     round-trip through the settings JSON and the hook shell.
+
+    The quoting is per-agent on Windows, because the two agents hand the string
+    to different shells and those shells have different grammars. Claude Code
+    runs hooks through a POSIX shell, so POSIX quoting is correct there. Codex
+    runs them through ``cmd.exe``, where a single quote is an ordinary
+    character, so a ``shlex.quote`` path (single-quoted, because a Windows path
+    contains backslashes) reaches cmd verbatim and the hook dies with::
+
+        The filename, directory name, or volume label syntax is incorrect.
+
+    which Codex reports as ``hook exited with code 1``.
+
+    A single shared format cannot serve both. Double quotes look portable but
+    are not: a POSIX shell still expands ``$`` and backticks inside them, and
+    still treats ``\\\\`` as an escaped backslash, so a UNC path loses a
+    separator and a ``$`` path component is eaten. Each shell therefore gets
+    its own routine.
     """
-    return " ".join(shlex.quote(a) for a in [*args, *tail])
+    tokens = [*args, *tail]
+    if sys.platform == "win32" and agent == "codex":
+        return " ".join(_cmd_quote(t) for t in tokens)
+    return " ".join(shlex.quote(a) for a in tokens)
 
 
 def agent_hooks_spec(args: list[str], agent: str) -> dict:
@@ -460,7 +603,7 @@ def agent_hooks_spec(args: list[str], agent: str) -> dict:
     signal. Both agents share ``UserPromptSubmit`` / ``PostToolUse`` / ``Stop``.
     """
     def cmd(*tail: str) -> dict:
-        return {"type": "command", "command": _hook_command(args, list(tail))}
+        return {"type": "command", "command": _hook_command(args, list(tail), agent)}
 
     if agent == "codex":
         # Codex parses a hook's stdout as JSON, so every Codex command passes

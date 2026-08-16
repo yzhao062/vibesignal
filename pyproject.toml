@@ -1,6 +1,6 @@
 [project]
 name = "vibesignal"
-version = "0.1.1"
+version = "0.1.2"
 description = "Physical status light for coding agents (Claude Code / Codex) via busylight"
 readme = "README.md"
 requires-python = ">=3.11"

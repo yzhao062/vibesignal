@@ -8,4 +8,4 @@ matching solid color. See README.md for the design.
 from .resolve import State, resolve_color
 
 __all__ = ["State", "resolve_color"]
-__version__ = "0.1.1"
+__version__ = "0.1.2"
