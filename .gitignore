@@ -21,3 +21,4 @@ agents/
 # (must be todo/*, not todo/ -- git cannot re-include a file under an excluded directory)
 todo/*
 !todo/README.md
+/agents/codex.md
